@@ -5,7 +5,7 @@ variable "aws_region" {
 
 variable "environment_name" {
   type    = string
-  default = "Dev"
+  default = "Sandbox"
 }
 
 variable "vpc_cidr" {
@@ -30,16 +30,6 @@ variable "private_subnet_cidrs" {
  type        = list(string)
  description = "Private Subnet CIDR values"
  default     = ["172.16.40.0/24", "172.16.50.0/24", "172.16.60.0/24"]
-}
-
-variable "tgw_destination_cidr_blocks" {
-  type = map(string)
-  default = {
-    "monitoring" = "10.17.0.0/16"
-    "prod"       = "172.31.0.0/16"
-    "qas"        = "172.23.0.0/16"
-    "dev"        = "172.16.0.0/16"
-  }
 }
 
 resource "aws_vpc" "main" {
@@ -114,7 +104,7 @@ resource "aws_nat_gateway" "nat_gateway" {
 }
 
 resource "aws_eip" "nat_gateway" {
-  vpc = true
+  domain = "vpc"
 }
 
 resource "aws_route" "private_subnet_default_route" {
@@ -127,19 +117,6 @@ resource "aws_route" "public_subnet_default_route" {
   route_table_id         = aws_route_table.public_route_table.id
   destination_cidr_block = "0.0.0.0/0"
   gateway_id             = aws_internet_gateway.igw.id
-}
-
-#--> Private TGW Routes
-resource "aws_route" "private_tgw_routes" {
-  for_each = {
-    for cidr_block, cidr_value in var.tgw_destination_cidr_blocks : cidr_block => cidr_value
-    if cidr_value != aws_vpc.main.cidr_block
-  }
-
-  depends_on             = [aws_ec2_transit_gateway_vpc_attachment.private_subnets]
-  route_table_id         = aws_route_table.private_route_table.id
-  destination_cidr_block = each.value
-  transit_gateway_id     = data.aws_ec2_transit_gateway.shared_tgw.id
 }
 
 resource "aws_security_group" "ssm_sg" {
@@ -222,20 +199,4 @@ resource "aws_vpc_endpoint" "ssmmessages_endpoint" {
   ]
 }
 EOF
-}
-
-data "aws_ec2_transit_gateway" "shared_tgw" {
-  filter {
-    name   = "options.amazon-side-asn"
-    values = ["64512"]
-  }
-}
-
-resource "aws_ec2_transit_gateway_vpc_attachment" "private_subnets" {
-  subnet_ids                 = aws_subnet.private_subnets.*.id
-  transit_gateway_id         = data.aws_ec2_transit_gateway.shared_tgw.id
-  vpc_id                     = aws_vpc.main.id
-  tags = {
-    Name = "${var.environment_name}-Attachment"
- }
 }
