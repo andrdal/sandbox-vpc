@@ -1,151 +1,241 @@
-variable "name" {
-  description = "The name of the VPC."
-  type        = string
+variable "aws_region" {
+  type    = string
+  default = "us-east-1"
 }
 
-variable "cidr" {
-  description = "The CIDR block for the VPC."
-  type        = string
+variable "environment_name" {
+  type    = string
+  default = "Dev"
+}
+
+variable "vpc_cidr" {
+ type        = string
+ description = "VPC Cidr Block"
+ default     = "172.16.0.0/16"
 }
 
 variable "azs" {
-  description = "A list of availability zones for the subnets."
-  type        = list(string)
+ type        = list(string)
+ description = "Availability Zones"
+ default     = ["us-east-1a", "us-east-1b", "us-east-1c"]
 }
 
-variable "private_subnets" {
-  description = "A list of private subnet CIDR blocks."
-  type        = list(string)
+variable "public_subnet_cidrs" {
+ type        = list(string)
+ description = "Public Subnet CIDR values"
+ default     = ["172.16.10.0/24", "172.16.20.0/24", "172.16.30.0/24"]
+}
+ 
+variable "private_subnet_cidrs" {
+ type        = list(string)
+ description = "Private Subnet CIDR values"
+ default     = ["172.16.40.0/24", "172.16.50.0/24", "172.16.60.0/24"]
 }
 
-variable "public_subnets" {
-  description = "A list of public subnet CIDR blocks."
-  type        = list(string)
-}
-
-variable "enable_nat_gateway" {
-  description = "Whether to enable a NAT gateway."
-  type        = bool
-  default     = false
-}
-
-variable "single_nat_gateway" {
-  description = "Whether to use a single NAT gateway."
-  type        = bool
-  default     = false
-}
-
-variable "tags" {
-  description = "Tags to apply to resources."
-  type        = map(string)
-  default     = {}
+variable "tgw_destination_cidr_blocks" {
+  type = map(string)
+  default = {
+    "monitoring" = "10.17.0.0/16"
+    "prod"       = "172.31.0.0/16"
+    "qas"        = "172.23.0.0/16"
+    "dev"        = "172.16.0.0/16"
+  }
 }
 
 resource "aws_vpc" "main" {
-  cidr_block           = var.cidr
+  cidr_block           = var.vpc_cidr
   enable_dns_support   = true
   enable_dns_hostnames = true
-
-  tags = merge(var.tags, {
-    Name = var.name
-  })
+  instance_tenancy     = "default"
+  tags = {
+    IsUsedForDeploy = "False"
+    Name            = "VPC-AFT-${var.environment_name}"
+  }
 }
 
-resource "aws_subnet" "public" {
-  count = length(var.public_subnets)
-
-  vpc_id                  = aws_vpc.main.id
-  cidr_block              = var.public_subnets[count.index]
-  availability_zone       = var.azs[count.index]
-  map_public_ip_on_launch = true
-
-  tags = merge(var.tags, {
-    Name = "${var.name}-public-${count.index}"
-  })
+resource "aws_subnet" "public_subnets" {
+ count      = length(var.public_subnet_cidrs)
+ map_public_ip_on_launch = true
+ vpc_id     = aws_vpc.main.id
+ cidr_block = element(var.public_subnet_cidrs, count.index)
+ availability_zone = element(var.azs, count.index)
+ tags = {
+   Name = "${var.environment_name}-Public Subnet ${count.index + 1}"
+ }
+}
+ 
+resource "aws_subnet" "private_subnets" {
+ count      = length(var.private_subnet_cidrs)
+ vpc_id     = aws_vpc.main.id
+ cidr_block = element(var.private_subnet_cidrs, count.index)
+ availability_zone = element(var.azs, count.index)
+ tags = {
+   Name = "${var.environment_name}-Private Subnet ${count.index + 1}"
+ }
 }
 
-resource "aws_subnet" "private" {
-  count = length(var.private_subnets)
+# Create the internet gateway
+resource "aws_internet_gateway" "igw" {
+  vpc_id = aws_vpc.main.id
+  tags = {
+   Name = "VPC-AFT-${var.environment_name}-IG"
+ }
+}
 
+resource "aws_route_table" "public_route_table" {
+  vpc_id = aws_vpc.main.id
+  tags = {
+    Name = "${var.environment_name}-Public Route Table"
+  }
+}
+
+resource "aws_route_table" "private_route_table" {
+  vpc_id = aws_vpc.main.id
+  tags = {
+    Name = "${var.environment_name}-Private Route Table"
+  }
+}
+
+resource "aws_route_table_association" "public_subnet_association" {
+  count          = length(aws_subnet.public_subnets)
+  subnet_id      = aws_subnet.public_subnets[count.index].id
+  route_table_id = aws_route_table.public_route_table.id
+}
+
+resource "aws_route_table_association" "private_subnet_association" {
+  count          = length(aws_subnet.private_subnets)
+  subnet_id      = aws_subnet.private_subnets[count.index].id
+  route_table_id = aws_route_table.private_route_table.id
+}
+
+resource "aws_nat_gateway" "nat_gateway" {
+  allocation_id = aws_eip.nat_gateway.id
+  subnet_id     = aws_subnet.public_subnets[0].id
+}
+
+resource "aws_eip" "nat_gateway" {
+  vpc = true
+}
+
+resource "aws_route" "private_subnet_default_route" {
+  route_table_id         = aws_route_table.private_route_table.id
+  destination_cidr_block = "0.0.0.0/0"
+  nat_gateway_id         = aws_nat_gateway.nat_gateway.id
+}
+
+resource "aws_route" "public_subnet_default_route" {
+  route_table_id         = aws_route_table.public_route_table.id
+  destination_cidr_block = "0.0.0.0/0"
+  gateway_id             = aws_internet_gateway.igw.id
+}
+
+#--> Private TGW Routes
+resource "aws_route" "private_tgw_routes" {
+  for_each = {
+    for cidr_block, cidr_value in var.tgw_destination_cidr_blocks : cidr_block => cidr_value
+    if cidr_value != aws_vpc.main.cidr_block
+  }
+
+  depends_on             = [aws_ec2_transit_gateway_vpc_attachment.private_subnets]
+  route_table_id         = aws_route_table.private_route_table.id
+  destination_cidr_block = each.value
+  transit_gateway_id     = data.aws_ec2_transit_gateway.shared_tgw.id
+}
+
+resource "aws_security_group" "ssm_sg" {
+  description = "VPC Endpoint Ports Required"
+  name        = "My SG Group for VPC SSM Endpoints"
+  tags        = {}
+  vpc_id      = aws_vpc.main.id
+  ingress {
+    cidr_blocks = [
+      "0.0.0.0/0"
+    ]
+    from_port = 443
+    protocol  = "tcp"
+    to_port   = 443
+  }
+  egress {
+    from_port        = 0
+    to_port          = 0
+    protocol         = "-1"
+    cidr_blocks      = ["0.0.0.0/0"]
+    ipv6_cidr_blocks = ["::/0"]
+  }
+}
+
+resource "aws_vpc_endpoint" "ssm_endpoint" {
+  vpc_endpoint_type = "Interface"
   vpc_id            = aws_vpc.main.id
-  cidr_block        = var.private_subnets[count.index]
-  availability_zone = var.azs[count.index]
-
-  tags = merge(var.tags, {
-    Name = "${var.name}-private-${count.index}"
-  })
+  service_name      = "com.amazonaws.${var.aws_region}.ssm"
+  subnet_ids        = aws_subnet.private_subnets.*.id
+  security_group_ids = [aws_security_group.ssm_sg.id]
+  policy            = <<EOF
+{
+  "Statement": [
+    {
+      "Action": "*", 
+      "Effect": "Allow", 
+      "Principal": "*", 
+      "Resource": "*"
+    }
+  ]
+}
+EOF
 }
 
-resource "aws_internet_gateway" "main" {
-  vpc_id = aws_vpc.main.id
-
-  tags = merge(var.tags, {
-    Name = "${var.name}-igw"
-  })
+resource "aws_vpc_endpoint" "ec2messages_endpoint" {
+  vpc_endpoint_type = "Interface"
+  vpc_id            = aws_vpc.main.id
+  service_name      = "com.amazonaws.${var.aws_region}.ec2messages"
+  subnet_ids        = aws_subnet.private_subnets.*.id
+  security_group_ids = [aws_security_group.ssm_sg.id]
+  policy            = <<EOF
+{
+  "Statement": [
+    {
+      "Action": "*", 
+      "Effect": "Allow", 
+      "Principal": "*", 
+      "Resource": "*"
+    }
+  ]
+}
+EOF
 }
 
-resource "aws_route_table" "public" {
-  vpc_id = aws_vpc.main.id
-
-  tags = merge(var.tags, {
-    Name = "${var.name}-public-rt"
-  })
+resource "aws_vpc_endpoint" "ssmmessages_endpoint" {
+  vpc_endpoint_type = "Interface"
+  vpc_id            = aws_vpc.main.id
+  service_name      = "com.amazonaws.${var.aws_region}.ssmmessages"
+  subnet_ids        = aws_subnet.private_subnets.*.id
+  security_group_ids = [aws_security_group.ssm_sg.id]
+  policy            = <<EOF
+{
+  "Statement": [
+    {
+      "Action": "*", 
+      "Effect": "Allow", 
+      "Principal": "*", 
+      "Resource": "*"
+    }
+  ]
+}
+EOF
 }
 
-resource "aws_route" "public" {
-  route_table_id         = aws_route_table.public.id
-  destination_cidr_block = "0.0.0.0/0"
-  gateway_id             = aws_internet_gateway.main.id
+data "aws_ec2_transit_gateway" "shared_tgw" {
+  filter {
+    name   = "options.amazon-side-asn"
+    values = ["64512"]
+  }
 }
 
-resource "aws_route_table_association" "public" {
-  count          = length(var.public_subnets)
-  subnet_id      = aws_subnet.public[count.index].id
-  route_table_id = aws_route_table.public.id
-}
-
-resource "aws_nat_gateway" "main" {
-  count         = var.enable_nat_gateway && var.single_nat_gateway ? 1 : 0
-  allocation_id = aws_eip.nat[count.index].id # Use count.index to reference the correct instance
-  subnet_id     = aws_subnet.public[0].id
-
-  tags = merge(var.tags, {
-    Name = "${var.name}-nat"
-  })
-}
-
-
-resource "aws_eip" "nat" {
-  count = var.enable_nat_gateway && var.single_nat_gateway ? 1 : 0
-
-  domain = "vpc" # Replaces the deprecated 'vpc' argument
-
-  tags = merge(var.tags, {
-    Name = "${var.name}-nat-eip"
-  })
-}
-
-resource "aws_route_table" "private" {
-  count = var.enable_nat_gateway && var.single_nat_gateway ? 1 : 0
-  vpc_id = aws_vpc.main.id
-
-  tags = merge(var.tags, {
-    Name = "${var.name}-private-rt"
-  })
-}
-
-resource "aws_route" "private" {
-  count = var.enable_nat_gateway && var.single_nat_gateway ? 1 : 0
-
-  route_table_id         = aws_route_table.private[count.index].id # Use count.index
-  destination_cidr_block = "0.0.0.0/0"
-  nat_gateway_id         = aws_nat_gateway.main[0].id
-}
-
-
-resource "aws_route_table_association" "private" {
-  count          = var.enable_nat_gateway && var.single_nat_gateway ? length(var.private_subnets) : 0
-
-  subnet_id      = aws_subnet.private[count.index].id
-  route_table_id = aws_route_table.private[0].id # Reference the correct route table (assumes one route table for all private subnets)
+resource "aws_ec2_transit_gateway_vpc_attachment" "private_subnets" {
+  subnet_ids                 = aws_subnet.private_subnets.*.id
+  transit_gateway_id         = data.aws_ec2_transit_gateway.shared_tgw.id
+  vpc_id                     = aws_vpc.main.id
+  tags = {
+    Name = "${var.environment_name}-Attachment"
+ }
 }
